@@ -10,11 +10,16 @@ const MERCADOPAGO_TOKEN = process.env.MERCADOPAGO_TOKEN;
 const MONGODB_URI = process.env.MONGODB_URI;
 const PORT = process.env.PORT || 3000;
 const RAILWAY_URL = process.env.RAILWAY_URL;
+const SEU_CHAT_ID = process.env.SEU_CHAT_ID; // Seu ID pessoal do Telegram
+const GRUPO_ID = process.env.GRUPO_ID; // ID do grupo no Telegram (começa com -100 para supergrupos)
 
 // Inicialização
 const app = express();
 const bot = new TelegramBot(TELEGRAM_TOKEN);
 let db;
+
+// Objeto para armazenar formulários em andamento
+const formulariosPendentes = new Map();
 
 // Middleware
 app.use(express.json());
@@ -60,7 +65,7 @@ async function verificarAssinatura(userId) {
   }
 }
 
-async function criarLinkPagamento(userId) {
+async function criarLinkPagamento(userId, dadosFormulario) {
   try {
     const response = await axios.post(
       "https://api.mercadopago.com/checkout/preferences",
@@ -79,7 +84,11 @@ async function criarLinkPagamento(userId) {
           pending: `${RAILWAY_URL}/pendente`,
         },
         notification_url: `${RAILWAY_URL}/mp-webhook`,
-        metadata: { telegram_user_id: userId },
+        metadata: {
+          telegram_user_id: userId,
+          nome: dadosFormulario.nome,
+          email: dadosFormulario.email,
+        },
       },
       {
         headers: {
@@ -96,6 +105,86 @@ async function criarLinkPagamento(userId) {
   }
 }
 
+// Função para enviar formulário
+async function enviarFormulario(chatId) {
+  return new Promise(async (resolve) => {
+    // Armazena o estado do formulário
+    const formulario = {
+      etapa: 1,
+      dados: {},
+    };
+    formulariosPendentes.set(chatId, formulario);
+
+    // Envia a primeira pergunta
+    await bot.sendMessage(
+      chatId,
+      "📝 Antes de gerar o link de pagamento, precisamos de algumas informações:"
+    );
+    await bot.sendMessage(chatId, "1. Qual seu nome completo?");
+
+    // Configura um listener temporário para as respostas
+    const listenerId = bot.on("message", async (msg) => {
+      if (msg.chat.id !== chatId || msg.text.startsWith("/")) return;
+
+      const formularioAtual = formulariosPendentes.get(chatId);
+
+      try {
+        switch (formularioAtual.etapa) {
+          case 1: // Nome
+            formularioAtual.dados.nome = msg.text;
+            formularioAtual.etapa = 2;
+            await bot.sendMessage(chatId, "2. Qual seu e-mail?");
+            break;
+
+          case 2: // Email
+            if (!msg.text.includes("@")) {
+              await bot.sendMessage(
+                chatId,
+                "❌ Por favor, digite um e-mail válido:"
+              );
+              return;
+            }
+            formularioAtual.dados.email = msg.text;
+            formularioAtual.etapa = 3;
+            await bot.sendMessage(chatId, "3. Qual seu telefone com DDD?");
+            break;
+
+          case 3: // Telefone
+            formularioAtual.dados.telefone = msg.text;
+
+            // Envia os dados para você
+            await bot.sendMessage(
+              SEU_CHAT_ID,
+              `📋 Novo formulário preenchido!\n\n` +
+                `👤 Nome: ${formularioAtual.dados.nome}\n` +
+                `📧 Email: ${formularioAtual.dados.email}\n` +
+                `📞 Telefone: ${formularioAtual.dados.telefone}\n` +
+                `🆔 ID do Usuário: ${chatId}`
+            );
+
+            // Salva no banco de dados
+            await db.collection("formularios").insertOne({
+              user_id: chatId,
+              ...formularioAtual.dados,
+              data_preenchimento: new Date(),
+            });
+
+            // Finaliza o formulário
+            formulariosPendentes.delete(chatId);
+            bot.removeListener("message", listenerId);
+            resolve(formularioAtual.dados);
+            break;
+        }
+      } catch (error) {
+        console.error("Erro no formulário:", error);
+        bot.removeListener("message", listenerId);
+        formulariosPendentes.delete(chatId);
+        throw error;
+      }
+    });
+  });
+}
+
 // Rotas
 app.post("/telegram-webhook", (req, res) => {
   bot.processUpdate(req.body);
@@ -106,8 +195,9 @@ app.post("/mp-webhook", async (req, res) => {
   try {
     const paymentId = req.body.data?.id;
 
-    if (!paymentId)
+    if (!paymentId) {
       return res.status(400).json({ error: "ID de pagamento ausente" });
+    }
 
     const response = await axios.get(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
@@ -122,6 +212,7 @@ app.post("/mp-webhook", async (req, res) => {
     const userId = metadata?.telegram_user_id;
 
     if (userId && status === "approved") {
+      // Atualiza o banco de dados
       await db.collection("users").updateOne(
         { user_id: userId },
         {
@@ -137,10 +228,33 @@ app.post("/mp-webhook", async (req, res) => {
         { upsert: true }
       );
 
+      // Notifica o usuário
       await bot.sendMessage(
         userId,
-        "🎉 Pagamento aprovado! Seu acesso foi liberado."
+        "🎉 Pagamento aprovado! Você será adicionado ao grupo em instantes."
       );
+
+      // Adiciona ao grupo e concede privilégios
+      try {
+        await bot.sendMessage(
+          GRUPO_ID,
+          `👋 Bem-vindo ${metadata.nome || "novo membro"} ao grupo!`
+        );
+
+        await bot.addChatMember(GRUPO_ID, userId);
+        await bot.sendMessage(
+          SEU_CHAT_ID,
+          `✅ Usuário ${userId} (${
+            metadata.nome || "sem nome"
+          }) adicionado ao grupo automaticamente.`
+        );
+      } catch (error) {
+        console.error("Erro ao adicionar ao grupo:", error);
+        await bot.sendMessage(
+          SEU_CHAT_ID,
+          `⚠️ Falha ao adicionar usuário ${userId} ao grupo. Erro: ${error.message}`
+        );
+      }
     }
 
     res.status(200).json({ status: "ok" });
@@ -156,31 +270,107 @@ bot.onText(/\/start/, async (msg) => {
 
   try {
     const isAssinante = await verificarAssinatura(chatId);
-    const message = isAssinante
-      ? "✅ Você é um assinante ativo! Acesso liberado."
-      : `🔒 Conteúdo exclusivo para assinantes!\n\n` +
-        `Para acessar, assine nosso serviço:\n` +
-        `${await criarLinkPagamento(chatId)}\n\n` +
-        `Após o pagamento, seu acesso será liberado automaticamente.`;
 
-    await bot.sendMessage(chatId, message);
+    if (isAssinante) {
+      await bot.sendMessage(
+        chatId,
+        "✅ Você já é um assinante ativo! Acesso liberado."
+      );
+      return;
+    }
+
+    // Inicia o fluxo do formulário
+    await bot.sendMessage(
+      chatId,
+      "Vamos precisar de algumas informações antes de gerar seu link de pagamento..."
+    );
+
+    const dadosFormulario = await enviarFormulario(chatId);
+
+    // Gera e envia o link de pagamento
+    const linkPagamento = await criarLinkPagamento(chatId, dadosFormulario);
+
+    await bot.sendMessage(
+      chatId,
+      `🔗 Aqui está seu link de pagamento exclusivo:\n${linkPagamento}\n\n` +
+        `Após o pagamento aprovado, você será adicionado automaticamente ao grupo.`
+    );
   } catch (error) {
     console.error("Erro no comando /start:", error);
     await bot.sendMessage(
       chatId,
-      "⚠️ Ocorreu um erro. Por favor, tente novamente mais tarde."
+      "⚠️ Ocorreu um erro no processo. Por favor, comece novamente com /start."
     );
+  }
+});
+
+// Comando para administradores verificarem dados
+bot.onText(/\/dados (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+
+  // Verifica se é o administrador
+  if (chatId.toString() !== SEU_CHAT_ID) {
+    await bot.sendMessage(chatId, "❌ Acesso negado.");
+    return;
+  }
+
+  const userId = match[1];
+
+  try {
+    const [usuario, formulario] = await Promise.all([
+      db.collection("users").findOne({ user_id: parseInt(userId) }),
+      db.collection("formularios").findOne({ user_id: parseInt(userId) }),
+    ]);
+
+    let resposta = `📊 Dados do usuário ${userId}:\n\n`;
+
+    if (formulario) {
+      resposta +=
+        `📝 Formulário:\n` +
+        `Nome: ${formulario.nome}\n` +
+        `Email: ${formulario.email}\n` +
+        `Telefone: ${formulario.telefone}\n` +
+        `Data: ${formulario.data_preenchimento}\n\n`;
+    }
+
+    if (usuario) {
+      resposta +=
+        `💳 Assinatura:\n` +
+        `Status: ${usuario.status}\n` +
+        `ID Pagamento: ${usuario.mp_subscription_id}\n` +
+        `Última atualização: ${usuario.updated_at}`;
+    }
+
+    await bot.sendMessage(chatId, resposta);
+  } catch (error) {
+    console.error("Erro ao buscar dados:", error);
+    await bot.sendMessage(chatId, "❌ Erro ao buscar dados do usuário.");
   }
 });
 
 // Health Check
 app.get("/", (req, res) => {
-  res.status(200).json({ status: "online", timestamp: new Date() });
+  res.status(200).json({
+    status: "online",
+    timestamp: new Date(),
+    formularios_ativos: formulariosPendentes.size,
+  });
 });
 
 // Inicialização
 async function startServer() {
   try {
+    // Verifica variáveis essenciais
+    if (
+      !TELEGRAM_TOKEN ||
+      !MERCADOPAGO_TOKEN ||
+      !MONGODB_URI ||
+      !SEU_CHAT_ID ||
+      !GRUPO_ID
+    ) {
+      throw new Error("Variáveis de ambiente essenciais faltando!");
+    }
+
     await connectDB();
     await setupWebhook();
 
@@ -188,6 +378,8 @@ async function startServer() {
       console.log(`🚀 Servidor rodando na porta ${PORT}`);
       console.log(`🔗 Webhook: ${RAILWAY_URL}/telegram-webhook`);
       console.log(`🔗 MercadoPago Webhook: ${RAILWAY_URL}/mp-webhook`);
+      console.log(`👤 Seu CHAT_ID: ${SEU_CHAT_ID}`);
+      console.log(`👥 GRUPO_ID: ${GRUPO_ID}`);
     });
   } catch (err) {
     console.error("Falha na inicialização:", err);
