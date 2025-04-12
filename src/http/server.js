@@ -4,7 +4,10 @@ import TelegramBot from "node-telegram-bot-api";
 import { MongoClient } from "mongodb";
 import "dotenv/config";
 import qrcode from "qrcode-terminal";
-import { Client, LocalAuth } from "whatsapp-web.js";
+
+// Importação correta para CommonJS
+import pkg from "whatsapp-web.js";
+const { Client, LocalAuth } = pkg;
 
 // Configurações
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -24,7 +27,10 @@ let db;
 // Configuração do WhatsApp
 const whatsappClient = new Client({
   authStrategy: new LocalAuth(),
-  puppeteer: { headless: true },
+  puppeteer: {
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"], // Adicionado para Railway
+  },
 });
 
 whatsappClient.on("qr", (qr) => {
@@ -34,6 +40,10 @@ whatsappClient.on("qr", (qr) => {
 
 whatsappClient.on("ready", () => {
   console.log("WhatsApp client está pronto!");
+});
+
+whatsappClient.on("auth_failure", (msg) => {
+  console.error("Falha na autenticação do WhatsApp:", msg);
 });
 
 whatsappClient.initialize();
