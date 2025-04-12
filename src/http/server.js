@@ -3,11 +3,6 @@ import axios from "axios";
 import TelegramBot from "node-telegram-bot-api";
 import { MongoClient } from "mongodb";
 import "dotenv/config";
-import qrcode from "qrcode-terminal";
-
-// Importação correta para CommonJS
-import pkg from "whatsapp-web.js";
-const { Client, LocalAuth } = pkg;
 
 // Configurações
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -17,36 +12,12 @@ const PORT = process.env.PORT || 3000;
 const RAILWAY_URL = process.env.RAILWAY_URL;
 const SEU_CHAT_ID = process.env.SEU_CHAT_ID;
 const GRUPO_ID = process.env.GRUPO_ID;
-const SEU_WHATSAPP = process.env.ZAP; // Seu número no formato internacional
+const SEU_WHATSAPP = process.env.ZAP; // Seu número no formato internacional (sem +)
 
 // Inicialização
 const app = express();
 const bot = new TelegramBot(TELEGRAM_TOKEN);
 let db;
-
-// Configuração do WhatsApp
-const whatsappClient = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"], // Adicionado para Railway
-  },
-});
-
-whatsappClient.on("qr", (qr) => {
-  qrcode.generate(qr, { small: true });
-  console.log("Escaneie o QR Code acima para conectar ao WhatsApp");
-});
-
-whatsappClient.on("ready", () => {
-  console.log("WhatsApp client está pronto!");
-});
-
-whatsappClient.on("auth_failure", (msg) => {
-  console.error("Falha na autenticação do WhatsApp:", msg);
-});
-
-whatsappClient.initialize();
 
 // Objeto para armazenar formulários em andamento
 const formulariosPendentes = new Map();
@@ -87,14 +58,35 @@ async function setupWebhook() {
   }
 }
 
-// Função para enviar mensagem ao WhatsApp
-async function enviarParaWhatsApp(mensagem) {
+// Função para gerar link do WhatsApp
+async function enviarParaWhatsApp(dados) {
   try {
-    const chatId = `${SEU_WHATSAPP}@c.us`;
-    await whatsappClient.sendMessage(chatId, mensagem);
-    console.log("Mensagem enviada para WhatsApp com sucesso");
+    const mensagem =
+      `✅ NOVO ASSINANTE\n\n` +
+      `Nome: ${dados.nome}\n` +
+      `Email: ${dados.email}\n` +
+      `Telefone: ${dados.telefone}\n` +
+      `ID Telegram: ${dados.userId}\n` +
+      `ID Pagamento: ${dados.paymentId || "N/A"}`;
+
+    // Cria o link do WhatsApp
+    const linkWhatsApp = `https://wa.me/${SEU_WHATSAPP}?text=${encodeURIComponent(
+      mensagem
+    )}`;
+
+    // 1. Mostra o link no console (para logs)
+    console.log("🔗 Link WhatsApp:", linkWhatsApp);
+
+    // 2. Envia pelo Telegram (você clica no link para abrir no WhatsApp)
+    await bot.sendMessage(
+      SEU_CHAT_ID,
+      `📤 Clique para enviar dados ao WhatsApp:\n${linkWhatsApp}`
+    );
+
+    return true;
   } catch (error) {
-    console.error("Erro ao enviar para WhatsApp:", error);
+    console.error("Erro ao gerar link WhatsApp:", error);
+    return false;
   }
 }
 
@@ -286,16 +278,14 @@ app.post("/mp-webhook", async (req, res) => {
         { upsert: true }
       );
 
-      // Envia para o WhatsApp
-      const mensagemWhatsApp =
-        `✅ NOVO ASSINANTE\n\n` +
-        `Nome: ${metadata.nome}\n` +
-        `Email: ${metadata.email}\n` +
-        `Telefone: ${metadata.telefone}\n` +
-        `ID Telegram: ${userId}\n` +
-        `ID Pagamento: ${paymentId}`;
-
-      await enviarParaWhatsApp(mensagemWhatsApp);
+      // Envia para o WhatsApp via link
+      await enviarParaWhatsApp({
+        nome: metadata.nome,
+        email: metadata.email,
+        telefone: metadata.telefone,
+        userId: userId,
+        paymentId: paymentId,
+      });
 
       // Notifica o usuário
       await bot.sendMessage(
