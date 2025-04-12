@@ -3,6 +3,8 @@ import axios from "axios";
 import TelegramBot from "node-telegram-bot-api";
 import { MongoClient } from "mongodb";
 import "dotenv/config";
+import qrcode from "qrcode-terminal";
+import { Client, LocalAuth } from "whatsapp-web.js";
 
 // Configurações
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -10,13 +12,31 @@ const MERCADOPAGO_TOKEN = process.env.MERCADOPAGO_TOKEN;
 const MONGODB_URI = process.env.MONGODB_URI;
 const PORT = process.env.PORT || 3000;
 const RAILWAY_URL = process.env.RAILWAY_URL;
-const SEU_CHAT_ID = process.env.SEU_CHAT_ID; // Seu ID pessoal do Telegram
-const GRUPO_ID = process.env.GRUPO_ID; // ID do grupo no Telegram (começa com -100 para supergrupos)
+const SEU_CHAT_ID = process.env.SEU_CHAT_ID;
+const GRUPO_ID = process.env.GRUPO_ID;
+const SEU_WHATSAPP = process.env.ZAP; // Seu número no formato internacional
 
 // Inicialização
 const app = express();
 const bot = new TelegramBot(TELEGRAM_TOKEN);
 let db;
+
+// Configuração do WhatsApp
+const whatsappClient = new Client({
+  authStrategy: new LocalAuth(),
+  puppeteer: { headless: true },
+});
+
+whatsappClient.on("qr", (qr) => {
+  qrcode.generate(qr, { small: true });
+  console.log("Escaneie o QR Code acima para conectar ao WhatsApp");
+});
+
+whatsappClient.on("ready", () => {
+  console.log("WhatsApp client está pronto!");
+});
+
+whatsappClient.initialize();
 
 // Objeto para armazenar formulários em andamento
 const formulariosPendentes = new Map();
@@ -47,10 +67,24 @@ async function connectDB() {
 // Configurar Webhook do Telegram
 async function setupWebhook() {
   try {
-    await bot.setWebHook(`${RAILWAY_URL}/telegram-webhook`);
+    const webhookUrl = `${RAILWAY_URL}/telegram-webhook`;
+    console.log(`Configurando webhook para: ${webhookUrl}`);
+    await bot.setWebHook(webhookUrl);
     console.log("Webhook configurado com sucesso!");
   } catch (err) {
     console.error("Erro ao configurar webhook:", err);
+    throw err;
+  }
+}
+
+// Função para enviar mensagem ao WhatsApp
+async function enviarParaWhatsApp(mensagem) {
+  try {
+    const chatId = `${SEU_WHATSAPP}@c.us`;
+    await whatsappClient.sendMessage(chatId, mensagem);
+    console.log("Mensagem enviada para WhatsApp com sucesso");
+  } catch (error) {
+    console.error("Erro ao enviar para WhatsApp:", error);
   }
 }
 
@@ -88,6 +122,7 @@ async function criarLinkPagamento(userId, dadosFormulario) {
           telegram_user_id: userId,
           nome: dadosFormulario.nome,
           email: dadosFormulario.email,
+          telefone: dadosFormulario.telefone,
         },
       },
       {
@@ -101,42 +136,53 @@ async function criarLinkPagamento(userId, dadosFormulario) {
     return response.data.init_point || response.data.sandbox_init_point;
   } catch (error) {
     console.error("Erro ao criar link de pagamento:", error);
-    return `${RAILWAY_URL}/assinatura`;
+    throw error;
   }
 }
 
 // Função para enviar formulário
 async function enviarFormulario(chatId) {
-  return new Promise(async (resolve) => {
-    // Armazena o estado do formulário
+  return new Promise(async (resolve, reject) => {
+    if (formulariosPendentes.has(chatId)) {
+      await bot.sendMessage(
+        chatId,
+        "ℹ️ Você já tem um formulário em andamento."
+      );
+      return reject(new Error("Formulário já em andamento"));
+    }
+
     const formulario = {
       etapa: 1,
       dados: {},
+      listener: null,
     };
+
     formulariosPendentes.set(chatId, formulario);
 
-    // Envia a primeira pergunta
-    await bot.sendMessage(
-      chatId,
-      "📝 Antes de gerar o link de pagamento, precisamos de algumas informações:"
-    );
-    await bot.sendMessage(chatId, "1. Qual seu nome completo?");
+    const timeout = setTimeout(() => {
+      if (formulario.listener) {
+        bot.removeListener("message", formulario.listener);
+      }
+      formulariosPendentes.delete(chatId);
+      bot.sendMessage(chatId, "⌛ Tempo expirado. Use /start para recomeçar.");
+      reject(new Error("Tempo expirado"));
+    }, 600000);
 
-    // Configura um listener temporário para as respostas
-    const listenerId = bot.on("message", async (msg) => {
+    formulario.listener = async (msg) => {
       if (msg.chat.id !== chatId || msg.text.startsWith("/")) return;
 
-      const formularioAtual = formulariosPendentes.get(chatId);
-
       try {
+        const formularioAtual = formulariosPendentes.get(chatId);
+        if (!formularioAtual) return;
+
         switch (formularioAtual.etapa) {
-          case 1: // Nome
+          case 1:
             formularioAtual.dados.nome = msg.text;
             formularioAtual.etapa = 2;
             await bot.sendMessage(chatId, "2. Qual seu e-mail?");
             break;
 
-          case 2: // Email
+          case 2:
             if (!msg.text.includes("@")) {
               await bot.sendMessage(
                 chatId,
@@ -149,18 +195,8 @@ async function enviarFormulario(chatId) {
             await bot.sendMessage(chatId, "3. Qual seu telefone com DDD?");
             break;
 
-          case 3: // Telefone
+          case 3:
             formularioAtual.dados.telefone = msg.text;
-
-            // Envia os dados para você
-            await bot.sendMessage(
-              SEU_CHAT_ID,
-              `📋 Novo formulário preenchido!\n\n` +
-                `👤 Nome: ${formularioAtual.dados.nome}\n` +
-                `📧 Email: ${formularioAtual.dados.email}\n` +
-                `📞 Telefone: ${formularioAtual.dados.telefone}\n` +
-                `🆔 ID do Usuário: ${chatId}`
-            );
 
             // Salva no banco de dados
             await db.collection("formularios").insertOne({
@@ -169,19 +205,36 @@ async function enviarFormulario(chatId) {
               data_preenchimento: new Date(),
             });
 
-            // Finaliza o formulário
+            // Limpa o estado
+            clearTimeout(timeout);
+            bot.removeListener("message", formularioAtual.listener);
             formulariosPendentes.delete(chatId);
-            bot.removeListener("message", listenerId);
             resolve(formularioAtual.dados);
             break;
         }
       } catch (error) {
-        console.error("Erro no formulário:", error);
-        bot.removeListener("message", listenerId);
+        clearTimeout(timeout);
+        if (formulario.listener) {
+          bot.removeListener("message", formulario.listener);
+        }
         formulariosPendentes.delete(chatId);
-        throw error;
+        reject(error);
       }
-    });
+    };
+
+    bot.on("message", formulario.listener);
+
+    try {
+      await bot.sendMessage(chatId, "📝 Precisamos de algumas informações:");
+      await bot.sendMessage(chatId, "1. Qual seu nome completo?");
+    } catch (error) {
+      clearTimeout(timeout);
+      if (formulario.listener) {
+        bot.removeListener("message", formulario.listener);
+      }
+      formulariosPendentes.delete(chatId);
+      reject(error);
+    }
   });
 }
 
@@ -194,18 +247,13 @@ app.post("/telegram-webhook", (req, res) => {
 app.post("/mp-webhook", async (req, res) => {
   try {
     const paymentId = req.body.data?.id;
-
     if (!paymentId) {
       return res.status(400).json({ error: "ID de pagamento ausente" });
     }
 
     const response = await axios.get(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
-      {
-        headers: {
-          Authorization: `Bearer ${MERCADOPAGO_TOKEN}`,
-        },
-      }
+      { headers: { Authorization: `Bearer ${MERCADOPAGO_TOKEN}` } }
     );
 
     const { metadata, status } = response.data;
@@ -228,31 +276,39 @@ app.post("/mp-webhook", async (req, res) => {
         { upsert: true }
       );
 
+      // Envia para o WhatsApp
+      const mensagemWhatsApp =
+        `✅ NOVO ASSINANTE\n\n` +
+        `Nome: ${metadata.nome}\n` +
+        `Email: ${metadata.email}\n` +
+        `Telefone: ${metadata.telefone}\n` +
+        `ID Telegram: ${userId}\n` +
+        `ID Pagamento: ${paymentId}`;
+
+      await enviarParaWhatsApp(mensagemWhatsApp);
+
       // Notifica o usuário
       await bot.sendMessage(
         userId,
         "🎉 Pagamento aprovado! Você será adicionado ao grupo em instantes."
       );
 
-      // Adiciona ao grupo e concede privilégios
+      // Adiciona ao grupo
       try {
+        await bot.addChatMember(GRUPO_ID, userId);
         await bot.sendMessage(
           GRUPO_ID,
           `👋 Bem-vindo ${metadata.nome || "novo membro"} ao grupo!`
         );
-
-        await bot.addChatMember(GRUPO_ID, userId);
-        await bot.sendMessage(
-          SEU_CHAT_ID,
-          `✅ Usuário ${userId} (${
-            metadata.nome || "sem nome"
-          }) adicionado ao grupo automaticamente.`
-        );
       } catch (error) {
         console.error("Erro ao adicionar ao grupo:", error);
+        const inviteLink = await bot.createChatInviteLink(GRUPO_ID, {
+          member_limit: 1,
+        });
+
         await bot.sendMessage(
-          SEU_CHAT_ID,
-          `⚠️ Falha ao adicionar usuário ${userId} ao grupo. Erro: ${error.message}`
+          userId,
+          `🔗 Aqui está seu link para o grupo: ${inviteLink.invite_link}`
         );
       }
     }
@@ -279,72 +335,33 @@ bot.onText(/\/start/, async (msg) => {
       return;
     }
 
-    // Inicia o fluxo do formulário
-    await bot.sendMessage(
-      chatId,
-      "Vamos precisar de algumas informações antes de gerar seu link de pagamento..."
-    );
+    try {
+      await bot.sendMessage(
+        chatId,
+        "Vamos precisar de algumas informações antes de gerar seu link de pagamento..."
+      );
 
-    const dadosFormulario = await enviarFormulario(chatId);
+      const dadosFormulario = await enviarFormulario(chatId);
+      const linkPagamento = await criarLinkPagamento(chatId, dadosFormulario);
 
-    // Gera e envia o link de pagamento
-    const linkPagamento = await criarLinkPagamento(chatId, dadosFormulario);
-
-    await bot.sendMessage(
-      chatId,
-      `🔗 Aqui está seu link de pagamento exclusivo:\n${linkPagamento}\n\n` +
-        `Após o pagamento aprovado, você será adicionado automaticamente ao grupo.`
-    );
+      await bot.sendMessage(
+        chatId,
+        `🔗 Aqui está seu link de pagamento:\n${linkPagamento}\n\n` +
+          `Após o pagamento, você será adicionado automaticamente ao grupo.`
+      );
+    } catch (error) {
+      console.error("Erro no formulário:", error);
+      await bot.sendMessage(
+        chatId,
+        "⚠️ Ocorreu um erro. Por favor, comece novamente com /start."
+      );
+    }
   } catch (error) {
     console.error("Erro no comando /start:", error);
     await bot.sendMessage(
       chatId,
-      "⚠️ Ocorreu um erro no processo. Por favor, comece novamente com /start."
+      "⚠️ Ocorreu um erro. Tente novamente mais tarde."
     );
-  }
-});
-
-// Comando para administradores verificarem dados
-bot.onText(/\/dados (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-
-  // Verifica se é o administrador
-  if (chatId.toString() !== SEU_CHAT_ID) {
-    await bot.sendMessage(chatId, "❌ Acesso negado.");
-    return;
-  }
-
-  const userId = match[1];
-
-  try {
-    const [usuario, formulario] = await Promise.all([
-      db.collection("users").findOne({ user_id: parseInt(userId) }),
-      db.collection("formularios").findOne({ user_id: parseInt(userId) }),
-    ]);
-
-    let resposta = `📊 Dados do usuário ${userId}:\n\n`;
-
-    if (formulario) {
-      resposta +=
-        `📝 Formulário:\n` +
-        `Nome: ${formulario.nome}\n` +
-        `Email: ${formulario.email}\n` +
-        `Telefone: ${formulario.telefone}\n` +
-        `Data: ${formulario.data_preenchimento}\n\n`;
-    }
-
-    if (usuario) {
-      resposta +=
-        `💳 Assinatura:\n` +
-        `Status: ${usuario.status}\n` +
-        `ID Pagamento: ${usuario.mp_subscription_id}\n` +
-        `Última atualização: ${usuario.updated_at}`;
-    }
-
-    await bot.sendMessage(chatId, resposta);
-  } catch (error) {
-    console.error("Erro ao buscar dados:", error);
-    await bot.sendMessage(chatId, "❌ Erro ao buscar dados do usuário.");
   }
 });
 
@@ -360,7 +377,8 @@ app.get("/", (req, res) => {
 // Inicialização
 async function startServer() {
   try {
-    // Verifica variáveis essenciais
+    console.log("Iniciando servidor...");
+
     if (
       !TELEGRAM_TOKEN ||
       !MERCADOPAGO_TOKEN ||
@@ -368,7 +386,7 @@ async function startServer() {
       !SEU_CHAT_ID ||
       !GRUPO_ID
     ) {
-      throw new Error("Variáveis de ambiente essenciais faltando!");
+      throw new Error("Variáveis de ambiente faltando!");
     }
 
     await connectDB();
@@ -378,8 +396,6 @@ async function startServer() {
       console.log(`🚀 Servidor rodando na porta ${PORT}`);
       console.log(`🔗 Webhook: ${RAILWAY_URL}/telegram-webhook`);
       console.log(`🔗 MercadoPago Webhook: ${RAILWAY_URL}/mp-webhook`);
-      console.log(`👤 Seu CHAT_ID: ${SEU_CHAT_ID}`);
-      console.log(`👥 GRUPO_ID: ${GRUPO_ID}`);
     });
   } catch (err) {
     console.error("Falha na inicialização:", err);
