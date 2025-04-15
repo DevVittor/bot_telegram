@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 const RAILWAY_URL = process.env.RAILWAY_URL;
 const SEU_CHAT_ID = process.env.SEU_CHAT_ID;
 const GRUPO_ID = process.env.GRUPO_ID;
-const SEU_WHATSAPP = process.env.ZAP; // Seu número no formato internacional (sem +)
+const SEU_WHATSAPP = process.env.ZAP;
 
 // Inicialização
 const app = express();
@@ -69,15 +69,11 @@ async function enviarParaWhatsApp(dados) {
       `ID Telegram: ${dados.userId}\n` +
       `ID Pagamento: ${dados.paymentId || "N/A"}`;
 
-    // Cria o link do WhatsApp
     const linkWhatsApp = `https://wa.me/${SEU_WHATSAPP}?text=${encodeURIComponent(
       mensagem
     )}`;
 
-    // 1. Mostra o link no console (para logs)
     console.log("🔗 Link WhatsApp:", linkWhatsApp);
-
-    // 2. Envia pelo Telegram (você clica no link para abrir no WhatsApp)
     await bot.sendMessage(
       SEU_CHAT_ID,
       `📤 Clique para enviar dados ao WhatsApp:\n${linkWhatsApp}`
@@ -200,14 +196,12 @@ async function enviarFormulario(chatId) {
           case 3:
             formularioAtual.dados.telefone = msg.text;
 
-            // Salva no banco de dados
             await db.collection("formularios").insertOne({
               user_id: chatId,
               ...formularioAtual.dados,
               data_preenchimento: new Date(),
             });
 
-            // Limpa o estado
             clearTimeout(timeout);
             bot.removeListener("message", formularioAtual.listener);
             formulariosPendentes.delete(chatId);
@@ -253,6 +247,8 @@ app.post("/mp-webhook", async (req, res) => {
       return res.status(400).json({ error: "ID de pagamento ausente" });
     }
 
+    console.log(`Processando pagamento ${paymentId}`);
+
     const response = await axios.get(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
       { headers: { Authorization: `Bearer ${MERCADOPAGO_TOKEN}` } }
@@ -262,7 +258,9 @@ app.post("/mp-webhook", async (req, res) => {
     const userId = metadata?.telegram_user_id;
 
     if (userId && status === "approved") {
-      // Atualiza o banco de dados
+      console.log(`Pagamento aprovado para usuário ${userId}`);
+
+      // 1. Atualiza o banco de dados
       await db.collection("users").updateOne(
         { user_id: userId },
         {
@@ -270,6 +268,9 @@ app.post("/mp-webhook", async (req, res) => {
             mp_subscription_id: paymentId,
             status: "active",
             updated_at: new Date(),
+            nome: metadata.nome,
+            email: metadata.email,
+            telefone: metadata.telefone,
           },
           $setOnInsert: {
             created_at: new Date(),
@@ -278,7 +279,7 @@ app.post("/mp-webhook", async (req, res) => {
         { upsert: true }
       );
 
-      // Envia para o WhatsApp via link
+      // 2. Envia para o WhatsApp
       await enviarParaWhatsApp({
         nome: metadata.nome,
         email: metadata.email,
@@ -287,28 +288,46 @@ app.post("/mp-webhook", async (req, res) => {
         paymentId: paymentId,
       });
 
-      // Notifica o usuário
+      // 3. Notifica o usuário
       await bot.sendMessage(
         userId,
         "🎉 Pagamento aprovado! Você será adicionado ao grupo em instantes."
       );
 
-      // Adiciona ao grupo
+      // 4. Tenta adicionar ao grupo
       try {
+        console.log(
+          `Tentando adicionar usuário ${userId} ao grupo ${GRUPO_ID}`
+        );
+
+        // Primeiro tenta adicionar diretamente
         await bot.addChatMember(GRUPO_ID, userId);
+
+        // Mensagem de boas-vindas no grupo
         await bot.sendMessage(
           GRUPO_ID,
           `👋 Bem-vindo ${metadata.nome || "novo membro"} ao grupo!`
         );
+
+        // Mensagem para o usuário
+        await bot.sendMessage(
+          userId,
+          `✅ Você foi adicionado ao grupo com sucesso!`
+        );
       } catch (error) {
         console.error("Erro ao adicionar ao grupo:", error);
+
+        // Se falhar, cria um link de convite único
         const inviteLink = await bot.createChatInviteLink(GRUPO_ID, {
           member_limit: 1,
+          name: `Convite para ${metadata.nome || userId}`,
+          creates_join_request: false,
         });
 
         await bot.sendMessage(
           userId,
-          `🔗 Aqui está seu link para o grupo: ${inviteLink.invite_link}`
+          `🔗 Clique neste link para entrar no grupo:\n${inviteLink.invite_link}\n\n` +
+            `Este link é válido apenas para você e expira após 1 uso.`
         );
       }
     }
