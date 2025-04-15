@@ -13,6 +13,7 @@ const RAILWAY_URL = process.env.RAILWAY_URL;
 const SEU_CHAT_ID = process.env.SEU_CHAT_ID;
 const GRUPO_ID = process.env.GRUPO_ID;
 const SEU_WHATSAPP = process.env.ZAP;
+const IS_SANDBOX = process.env.NODE_ENV !== "production"; // Sandbox por padrão, a menos que seja produção
 
 // Inicialização
 const app = express();
@@ -27,21 +28,33 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.disable("x-powered-by");
 
-// Conexão com MongoDB
+// Conexão com MongoDB com retry
 async function connectDB() {
   const client = new MongoClient(MONGODB_URI, {
     serverSelectionTimeoutMS: 5000,
     connectTimeoutMS: 10000,
   });
 
-  try {
-    await client.connect();
-    db = client.db("telegram_bot");
-    await db.command({ ping: 1 });
-    console.log("Conectado ao MongoDB com sucesso!");
-  } catch (err) {
-    console.error("Falha na conexão com MongoDB:", err);
-    process.exit(1);
+  let retries = 3;
+  while (retries) {
+    try {
+      await client.connect();
+      db = client.db("telegram_bot");
+      await db.command({ ping: 1 });
+      console.log("Conectado ao MongoDB com sucesso!");
+      return;
+    } catch (err) {
+      console.error(
+        `Falha na conexão com MongoDB (tentativa ${4 - retries}):`,
+        err
+      );
+      retries -= 1;
+      if (retries === 0) {
+        console.error("Não foi possível conectar ao MongoDB.");
+        process.exit(1);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
   }
 }
 
@@ -72,16 +85,13 @@ async function enviarParaWhatsApp(dados) {
     const linkWhatsApp = `https://wa.me/${SEU_WHATSAPP}?text=${encodeURIComponent(
       mensagem
     )}`;
-
-    console.log("🔗 Link WhatsApp:", linkWhatsApp);
     await bot.sendMessage(
       SEU_CHAT_ID,
       `📤 Clique para enviar dados ao WhatsApp:\n${linkWhatsApp}`
     );
-
     return true;
   } catch (error) {
-    console.error("Erro ao gerar link WhatsApp:", error);
+    console.error("Erro ao gerar link WhatsApp:", error.message);
     return false;
   }
 }
@@ -92,7 +102,7 @@ async function verificarAssinatura(userId) {
     const user = await db.collection("users").findOne({ user_id: userId });
     return user && user.status === "active";
   } catch (err) {
-    console.error("Erro ao verificar assinatura:", err);
+    console.error("Erro ao verificar assinatura:", err.message);
     return false;
   }
 }
@@ -131,11 +141,26 @@ async function criarLinkPagamento(userId, dadosFormulario) {
       }
     );
 
-    return response.data.init_point || response.data.sandbox_init_point;
+    // Retorna o link apropriado com base no ambiente
+    return IS_SANDBOX
+      ? response.data.sandbox_init_point
+      : response.data.init_point;
   } catch (error) {
-    console.error("Erro ao criar link de pagamento:", error);
+    console.error("Erro ao criar link de pagamento:", error.message);
     throw error;
   }
+}
+
+// Função para validar e-mail
+function isValidEmail(email) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+}
+
+// Função para validar telefone (simples, aceita formatos com DDD)
+function isValidPhone(phone) {
+  const phoneRegex = /^\+?\d{10,15}$/;
+  return phoneRegex.test(phone.replace(/\D/g, ""));
 }
 
 // Função para enviar formulário
@@ -164,7 +189,7 @@ async function enviarFormulario(chatId) {
       formulariosPendentes.delete(chatId);
       bot.sendMessage(chatId, "⌛ Tempo expirado. Use /start para recomeçar.");
       reject(new Error("Tempo expirado"));
-    }, 600000);
+    }, 300000); // Reduzido para 5 minutos
 
     formulario.listener = async (msg) => {
       if (msg.chat.id !== chatId || msg.text.startsWith("/")) return;
@@ -175,26 +200,36 @@ async function enviarFormulario(chatId) {
 
         switch (formularioAtual.etapa) {
           case 1:
-            formularioAtual.dados.nome = msg.text;
+            formularioAtual.dados.nome = msg.text.trim();
             formularioAtual.etapa = 2;
             await bot.sendMessage(chatId, "2. Qual seu e-mail?");
             break;
 
           case 2:
-            if (!msg.text.includes("@")) {
+            if (!isValidEmail(msg.text)) {
               await bot.sendMessage(
                 chatId,
                 "❌ Por favor, digite um e-mail válido:"
               );
               return;
             }
-            formularioAtual.dados.email = msg.text;
+            formularioAtual.dados.email = msg.text.trim();
             formularioAtual.etapa = 3;
-            await bot.sendMessage(chatId, "3. Qual seu telefone com DDD?");
+            await bot.sendMessage(
+              chatId,
+              "3. Qual seu telefone com DDD? (Ex.: +5511999999999)"
+            );
             break;
 
           case 3:
-            formularioAtual.dados.telefone = msg.text;
+            if (!isValidPhone(msg.text)) {
+              await bot.sendMessage(
+                chatId,
+                "❌ Por favor, digite um telefone válido:"
+              );
+              return;
+            }
+            formularioAtual.dados.telefone = msg.text.trim();
 
             await db.collection("formularios").insertOne({
               user_id: chatId,
@@ -242,12 +277,20 @@ app.post("/telegram-webhook", (req, res) => {
 
 app.post("/mp-webhook", async (req, res) => {
   try {
-    const paymentId = req.body.data?.id;
-    if (!paymentId) {
-      return res.status(400).json({ error: "ID de pagamento ausente" });
+    const { type, data } = req.body;
+    if (type !== "payment" || !data?.id) {
+      return res.status(200).json({ status: "ignored" });
     }
 
-    console.log(`Processando pagamento ${paymentId}`);
+    const paymentId = data.id;
+
+    // Verifica se o pagamento já foi processado
+    const existingPayment = await db
+      .collection("payments")
+      .findOne({ payment_id: paymentId });
+    if (existingPayment) {
+      return res.status(200).json({ status: "already_processed" });
+    }
 
     const response = await axios.get(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
@@ -258,9 +301,15 @@ app.post("/mp-webhook", async (req, res) => {
     const userId = metadata?.telegram_user_id;
 
     if (userId && status === "approved") {
-      console.log(`Pagamento aprovado para usuário ${userId}`);
+      // Salva o pagamento para evitar duplicatas
+      await db.collection("payments").insertOne({
+        payment_id: paymentId,
+        user_id: userId,
+        status: "approved",
+        created_at: new Date(),
+      });
 
-      // 1. Atualiza o banco de dados
+      // Atualiza o banco de dados
       await db.collection("users").updateOne(
         { user_id: userId },
         {
@@ -279,7 +328,7 @@ app.post("/mp-webhook", async (req, res) => {
         { upsert: true }
       );
 
-      // 2. Envia para o WhatsApp
+      // Envia para o WhatsApp
       await enviarParaWhatsApp({
         nome: metadata.nome,
         email: metadata.email,
@@ -288,20 +337,15 @@ app.post("/mp-webhook", async (req, res) => {
         paymentId: paymentId,
       });
 
-      // 3. Notifica o usuário
+      // Notifica o usuário
       await bot.sendMessage(
         userId,
         "🎉 Pagamento aprovado! Você será adicionado ao grupo em instantes."
       );
 
-      // 4. Tenta adicionar ao grupo
+      // Tenta adicionar ao grupo
       try {
-        console.log(
-          `Tentando adicionar usuário ${userId} ao grupo ${GRUPO_ID}`
-        );
-
-        // Primeiro tenta adicionar diretamente
-        await bot.addChatMember(GRUPO_ID, userId);
+        await bot.inviteChatMember(GRUPO_ID, userId); // Atualizado para inviteChatMember
 
         // Mensagem de boas-vindas no grupo
         await bot.sendMessage(
@@ -315,9 +359,9 @@ app.post("/mp-webhook", async (req, res) => {
           `✅ Você foi adicionado ao grupo com sucesso!`
         );
       } catch (error) {
-        console.error("Erro ao adicionar ao grupo:", error);
+        console.error("Erro ao adicionar ao grupo:", error.message);
 
-        // Se falhar, cria um link de convite único
+        // Cria um link de convite único
         const inviteLink = await bot.createChatInviteLink(GRUPO_ID, {
           member_limit: 1,
           name: `Convite para ${metadata.nome || userId}`,
@@ -334,7 +378,7 @@ app.post("/mp-webhook", async (req, res) => {
 
     res.status(200).json({ status: "ok" });
   } catch (error) {
-    console.error("Erro no webhook:", error);
+    console.error("Erro no webhook:", error.message);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -369,14 +413,14 @@ bot.onText(/\/start/, async (msg) => {
           `Após o pagamento, você será adicionado automaticamente ao grupo.`
       );
     } catch (error) {
-      console.error("Erro no formulário:", error);
+      console.error("Erro no formulário:", error.message);
       await bot.sendMessage(
         chatId,
         "⚠️ Ocorreu um erro. Por favor, comece novamente com /start."
       );
     }
   } catch (error) {
-    console.error("Erro no comando /start:", error);
+    console.error("Erro no comando /start:", error.message);
     await bot.sendMessage(
       chatId,
       "⚠️ Ocorreu um erro. Tente novamente mais tarde."
@@ -403,9 +447,15 @@ async function startServer() {
       !MERCADOPAGO_TOKEN ||
       !MONGODB_URI ||
       !SEU_CHAT_ID ||
-      !GRUPO_ID
+      !GRUPO_ID ||
+      !SEU_WHATSAPP
     ) {
       throw new Error("Variáveis de ambiente faltando!");
+    }
+
+    // Valida se o Access Token é de teste no Sandbox
+    if (IS_SANDBOX && !MERCADOPAGO_TOKEN.startsWith("TEST-")) {
+      throw new Error("No modo Sandbox, use um Access Token de teste (TEST-).");
     }
 
     await connectDB();
@@ -413,11 +463,11 @@ async function startServer() {
 
     app.listen(PORT, () => {
       console.log(`🚀 Servidor rodando na porta ${PORT}`);
-      console.log(`🔗 Webhook: ${RAILWAY_URL}/telegram-webhook`);
-      console.log(`🔗 MercadoPago Webhook: ${RAILWAY_URL}/mp-webhook`);
+      console.log(`🔗 Webhook Telegram: ${RAILWAY_URL}/telegram-webhook`);
+      console.log(`🔗 Webhook Mercado Pago: ${RAILWAY_URL}/mp-webhook`);
     });
   } catch (err) {
-    console.error("Falha na inicialização:", err);
+    console.error("Falha na inicialização:", err.message);
     process.exit(1);
   }
 }
